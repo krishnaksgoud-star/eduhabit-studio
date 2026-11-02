@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EduHabit Studio</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>tailwind.config = { darkMode: 'class' }</script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root { --bg1:#e8eefc; --bg2:#f6e9ff; --fg:#0f172a; }
+  .dark { --bg1:#0b1020; --bg2:#1a1038; --fg:#e5e7eb; }
+  html, body, #root { height: 100%; margin: 0; }
+  body { color: var(--fg); font-family: 'Segoe UI', system-ui, 'Nirmala UI', sans-serif; overflow: hidden; }
+  #bg { position: fixed; inset: 0; z-index: -1; background: linear-gradient(135deg, var(--bg1), var(--bg2)); background-size: cover; background-position: center; }
+  .eng-kw { background: rgba(99,102,241,.18); color: #6366f1; padding: 0 .3em; border-radius: .35em; font-weight: 600; }
+  .dark .eng-kw { color: #a5b4fc; }
+  .te p { margin: 0 0 .9em; line-height: 1.95; }
+  .te { font-family: 'Nirmala UI', 'Noto Sans Telugu', 'Segoe UI', sans-serif; font-size: 1.05rem; }
+  ::-webkit-scrollbar { width: 8px; height: 8px } ::-webkit-scrollbar-thumb { background: rgba(130,130,160,.4); border-radius: 8px }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(8px) } to { opacity: 1; transform: none } }
+  .fade { animation: fadeUp .35s ease both }
+</style>
+</head>
+<body>
+<div id="bg"></div>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+/* ---------- storage helpers ---------- */
+const LS = 'eduhabit.state.v1';
+const DB_NAME = 'eduhabit-pdfs';
+const openDB = () => new Promise((res, rej) => {
+  const r = indexedDB.open(DB_NAME, 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('pdfs');
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+const idb = {
+  async put(k, v) { const db = await openDB(); return new Promise((res, rej) => { const t = db.transaction('pdfs', 'readwrite'); t.objectStore('pdfs').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); }); },
+  async get(k) { const db = await openDB(); return new Promise((res, rej) => { const q = db.transaction('pdfs').objectStore('pdfs').get(k); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); },
+  async del(k) { const db = await openDB(); return new Promise(res => { const t = db.transaction('pdfs', 'readwrite'); t.objectStore('pdfs').delete(k); t.oncomplete = res; }); },
+  async clear() { const db = await openDB(); return new Promise(res => { const t = db.transaction('pdfs', 'readwrite'); t.objectStore('pdfs').clear(); t.oncomplete = res; }); },
+  async all() { const db = await openDB(); return new Promise(res => { const out = {}; const t = db.transaction('pdfs'); const c = t.objectStore('pdfs').openCursor(); c.onsuccess = e => { const cur = e.target.result; if (cur) { out[cur.key] = cur.value; cur.continue(); } }; t.oncomplete = () => res(out); }); }
+};
+const defaultState = {
+  folders: [{ id: 'f1', name: 'General' }], docs: [],
+  settings: { apiKey: '', model: 'gemini-2.5-flash', dark: true, wallpaper: '' },
+  session: { tab: 'home', folderId: 'f1', docId: null, page: 1, sidebar: true }
+};
+const loadState = () => { try { const s = JSON.parse(localStorage.getItem(LS)); if (s) return { ...defaultState, ...s, settings: { ...defaultState.settings, ...s.settings }, session: { ...defaultState.session, ...s.session } }; } catch (e) {} return defaultState; };
+const b64 = u8 => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+(async () => {
+  const url = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  try { const t = await (await fetch(url)).text(); pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([t], { type: 'text/javascript' })); }
+  catch (e) { pdfjsLib.GlobalWorkerOptions.workerSrc = url; }
+})();
+
+/* ---------- Gemini ---------- */
+const SYS = "You are an expert bilingual tutor. Analyze the following textbook page text and explain it in detail. Return pure JSON matching: { chapter: string, teluguTranslation: string (with <span class='eng-kw'> for technical English terms, <p>, <b>), studyNote: string, quiz: { q: string, options: string[], ans: number, explanation: string } }. The quiz explanation must be written in Telugu. ans is the zero-based index of the correct option.";
+async function explainPage(text, settings) {
+  if (!settings.apiKey) throw new Error('Add your Gemini API key in Settings first.');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(settings.model || 'gemini-2.5-flash')}:generateContent?key=${encodeURIComponent(settings.apiKey)}`;
+  const r = await fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: SYS + '\n\nPAGE TEXT:\n' + text.slice(0, 12000) }] }],
+      generationConfig: { temperature: 0.4, responseMimeType: 'application/json' }
+    })
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data?.error?.message || 'Gemini request failed (' + r.status + ')');
+  const raw = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
+  const clean = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+  const j = JSON.parse(clean);
+  if (!j.quiz || !Array.isArray(j.quiz.options)) throw new Error('AI returned an unexpected format. Try again.');
+  return j;
+}
+
+/* ---------- UI atoms ---------- */
+const glass = 'bg-white/60 dark:bg-white/5 backdrop-blur-md border border-black/10 dark:border-white/10 shadow-xl shadow-black/10 dark:shadow-black/40';
+const Btn = ({ className = '', ...p }) => <button {...p} className={`transition active:scale-95 hover:brightness-110 disabled:opacity-50 ${className}`} />;
+const IconBtn = ({ children, title, onClick, className = '' }) => <Btn title={title} onClick={onClick} className={`h-9 px-3 rounded-xl ${glass} text-sm ${className}`}>{children}</Btn>;
+
+/* ---------- PDF page canvas ---------- */
+function PdfPane({ pdf, page }) {
+  const ref = useRef(); const box = useRef(); const task = useRef();
+  useEffect(() => {
+    if (!pdf) return; let dead = false;
+    (async () => {
+      const p = await pdf.getPage(page); if (dead) return;
+      const w = (box.current?.clientWidth || 600) - 24;
+      const base = p.getViewport({ scale: 1 }); const scale = Math.min(w / base.width, 2.2);
+      const vp = p.getViewport({ scale: scale * (window.devicePixelRatio || 1) });
+      const c = ref.current; c.width = vp.width; c.height = vp.height; c.style.width = vp.width / (window.devicePixelRatio || 1) + 'px';
+      task.current?.cancel?.();
+      task.current = p.render({ canvasContext: c.getContext('2d'), viewport: vp });
+      try { await task.current.promise; } catch (e) {}
+    })();
+    return () => { dead = true; };
+  }, [pdf, page]);
+  return <div ref={box} className="h-full overflow-auto p-3 flex justify-center items-start"><canvas ref={ref} className="rounded-lg shadow-2xl bg-white" /></div>;
+}
+
+/* ---------- Main App ---------- */
+function App() {
+  const [st, setSt] = useState(loadState);
+  const [pdf, setPdf] = useState(null);
+  const [busy, setBusy] = useState('');
+  const [err, setErr] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
+  const [hidePdf, setHidePdf] = useState(false);
+  const [isFs, setIsFs] = useState(false);
+  const fileRef = useRef();
+  const { folders, docs, settings, session } = st;
+  const doc = docs.find(d => d.id === session.docId);
+  const folder = folders.find(f => f.id === session.folderId);
+  const pg = doc?.pages[session.page - 1];
+
+  useEffect(() => { try { localStorage.setItem(LS, JSON.stringify(st)); } catch (e) { setErr('Storage is full — export a backup.'); } }, [st]);
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', settings.dark);
+    const bg = document.getElementById('bg');
+    bg.style.backgroundImage = settings.wallpaper ? `url("${settings.wallpaper.replace(/"/g, '')}")` : '';
+    const bg = document.getElementById('bg');
+  }, [settings.dark, settings.wallpaper]);
+  useEffect(() => { const f = () => setIsFs(!!document.fullscreenElement); document.addEventListener('fullscreenchange', f); return () => document.removeEventListener('fullscreenchange', f); }, []);
+
+  // load PDF bytes when active doc changes
+  useEffect(() => {
+    let dead = false; setPdf(null);
+    if (!session.docId) return;
+    (async () => {
+      try { const bytes = await idb.get(session.docId); if (!bytes || dead) return; const p = await pdfjsLib.getDocument({ data: bytes.slice() }).promise; if (!dead) setPdf(p); }
+      catch (e) { setErr('Could not open PDF: ' + e.message); }
+    })();
+    return () => { dead = true; };
+  }, [session.docId]);
+
+  const setSession = patch => setSt(s => ({ ...s, session: { ...s.session, ...patch } }));
+  const setSettings = patch => setSt(s => ({ ...s, settings: { ...s.settings, ...patch } }));
+  const updatePage = (n, patch) => setSt(s => ({ ...s, docs: s.docs.map(d => d.id === s.session.docId ? { ...d, pages: d.pages.map((p, i) => i === n - 1 ? { ...p, ...patch } : p) } : d) }));
+  const toggleFs = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {});
+
+  const addFolder = () => { const name = prompt('Folder / subject name'); if (!name?.trim()) return; const id = uid(); setSt(s => ({ ...s, folders: [...s.folders, { id, name: name.trim() }], session: { ...s.session, folderId: id, docId: null, tab: 'home' } })); };
+  const delFolder = async f => {
+    if (!confirm(`Delete "${f.name}" and all its PDFs?`)) return;
+    for (const d of docs.filter(d => d.folderId === f.id)) await idb.del(d.id);
+    setSt(s => { const rest = s.folders.filter(x => x.id !== f.id); const fid = rest[0]?.id || null; return { ...s, folders: rest, docs: s.docs.filter(d => d.folderId !== f.id), session: { ...s.session, folderId: fid, docId: null, tab: 'home' } }; });
+  };
+  const delDoc = async d => { if (!confirm(`Remove "${d.name}"?`)) return; await idb.del(d.id); setSt(s => ({ ...s, docs: s.docs.filter(x => x.id !== d.id), session: { ...s.session, docId: s.session.docId === d.id ? null : s.session.docId } })); };
+
+  const upload = async e => {
+    const file = e.target.files[0]; e.target.value = ''; if (!file || !folder) return;
+    setErr(''); setBusy('Reading PDF…');
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const p = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+      const pages = [];
+      for (let i = 1; i <= p.numPages; i++) {
+        setBusy(`Extracting text… ${i}/${p.numPages}`);
+        const tc = await (await p.getPage(i)).getTextContent();
+        pages.push({ pageNumber: i, rawText: tc.items.map(x => x.str).join(' ').replace(/\s+/g, ' ').trim(), isExplained: false, isLearned: false, chapter: '', teluguTranslation: '', studyNote: '', quiz: null });
+      }
+      const id = uid(); await idb.put(id, bytes);
+      setSt(s => ({ ...s, docs: [...s.docs, { id, folderId: folder.id, name: file.name.replace(/\.pdf$/i, ''), pages }], session: { ...s.session, docId: id, page: 1 } }));
+    } catch (ex) { setErr('Upload failed: ' + ex.message); }
+    setBusy('');
+  };
+
+  const explain = async () => {
+    if (!pg) return; setErr('');
+    if (!pg.rawText || pg.rawText.length < 20) { setErr('This page has no selectable text (scanned image?). Nothing to explain.'); return; }
+    const n = session.page; setBusy('✨ Asking Gemini…');
+    try { const j = await explainPage(pg.rawText, settings); updatePage(n, { ...j, isExplained: true }); }
+    catch (ex) { setErr(ex.message); }
+    setBusy('');
+  };
+
+  const exportAll = async () => {
+    const blobs = await idb.all(); const pdfs = {}; for (const k in blobs) pdfs[k] = b64(blobs[k]);
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify({ state: st, pdfs })], { type: 'application/json' }));
+    a.download = `eduhabit-backup-${new Date().toISOString().slice(0, 10)}.json`; a.click();
+  };
+  const importAll = e => {
+    const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+    const r = new FileReader();
+    r.onload = async () => {
+      try {
+        const j = JSON.parse(r.result); if (!j.state?.folders) throw new Error('Not an EduHabit backup');
+        await idb.clear(); for (const k in (j.pdfs || {})) await idb.put(k, unb64(j.pdfs[k]));
+        setSt({ ...defaultState, ...j.state, settings: { ...defaultState.settings, ...j.state.settings }, session: { ...defaultState.session, ...j.state.session } });
+        setShowSettings(false);
+      } catch (ex) { setErr('Import failed: ' + ex.message); }
+    };
+    r.readAsText(f);
+  };
+  const reset = async () => { if (!confirm('Erase ALL folders, PDFs, notes and settings?')) return; await idb.clear(); localStorage.removeItem(LS); setSt(defaultState); setShowSettings(false); };
+
+  const folderDocs = docs.filter(d => d.folderId === session.folderId);
+  const tabs = [['home', '🏠 Home'], ['learn', '📖 Learn'], ['study', '🗒️ Study'], ['test', '🧪 Test'], ['revise', '⚡ Revision']];
+
+  return (
+    <div className="h-full flex flex-col p-3 gap-3">
+      {/* top bar */}
+      <header className={`${glass} rounded-2xl px-3 py-2 flex items-center gap-2`}>
+        <IconBtn title="Toggle sidebar" onClick={() => setSession({ sidebar: !session.sidebar })}>{session.sidebar ? '⟨' : '☰'}</IconBtn>
+        <div className="font-bold tracking-tight mr-2 text-lg bg-gradient-to-r from-indigo-500 to-fuchsia-500 bg-clip-text text-transparent">EduHabit Studio</div>
+        <nav className="flex gap-1 flex-1 overflow-x-auto">
+          {tabs.map(([k, l]) => <Btn key={k} onClick={() => setSession({ tab: k })} className={`px-3 h-9 rounded-xl text-sm whitespace-nowrap ${session.tab === k ? 'bg-indigo-500 text-white shadow-lg shadow-indigo-500/40' : 'hover:bg-black/5 dark:hover:bg-white/10'}`}>{l}</Btn>)}
+        </nav>
+        <IconBtn title="Full screen" onClick={toggleFs}>{isFs ? '⤢ Exit' : '⛶'}</IconBtn>
+        <IconBtn title="Settings" onClick={() => setShowSettings(true)}>⚙️</IconBtn>
+      </header>
+
+      <div className="flex-1 flex gap-3 min-h-0">
+        {/* sidebar */}
+        <aside className={`${glass} rounded-2xl overflow-hidden transition-all duration-300 flex flex-col ${session.sidebar ? 'w-64 opacity-100' : 'w-0 opacity-0 border-0 -mr-3'}`}>
+          <div className="p-3 flex items-center justify-between min-w-[16rem]"><span className="text-xs uppercase tracking-widest opacity-60">Subjects</span><Btn onClick={addFolder} className="text-xs px-2 py-1 rounded-lg bg-indigo-500 text-white">+ New</Btn></div>
+          <div className="flex-1 overflow-auto px-2 pb-3 min-w-[16rem]">
+            {folders.map(f => (
+              <div key={f.id} className="mb-1">
+                <div className={`group flex items-center rounded-xl px-2 py-2 cursor-pointer ${f.id === session.folderId ? 'bg-indigo-500/20' : 'hover:bg-black/5 dark:hover:bg-white/10'}`} onClick={() => setSession({ folderId: f.id, docId: null, tab: 'home' })}>
+                  <span className="flex-1 truncate text-sm">📁 {f.name}</span>
+                  <button className="opacity-0 group-hover:opacity-70 text-xs" onClick={e => { e.stopPropagation(); delFolder(f); }}>🗑</button>
+                </div>
+                {f.id === session.folderId && docs.filter(d => d.folderId === f.id).map(d => (
+                  <div key={d.id} className={`group ml-4 flex items-center rounded-lg px-2 py-1.5 cursor-pointer text-sm ${d.id === session.docId ? 'bg-fuchsia-500/20' : 'hover:bg-black/5 dark:hover:bg-white/10'}`} onClick={() => setSession({ docId: d.id, page: 1 })}>
+                    <span className="flex-1 truncate">📄 {d.name}</span>
+                    <button className="opacity-0 group-hover:opacity-70 text-xs" onClick={e => { e.stopPropagation(); delDoc(d); }}>✕</button>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </aside>
+
+        {/* main */}
+        <main className={`${glass} rounded-2xl flex-1 min-w-0 overflow-hidden relative`}>
+          {err && <div className="absolute top-3 left-1/2 -translate-x-1/2 z-30 bg-red-500 text-white text-sm px-4 py-2 rounded-xl shadow-xl max-w-[80%] flex gap-3">{err}<button onClick={() => setErr('')}>✕</button></div>}
+          {busy && <div className="absolute inset-0 z-20 grid place-items-center bg-black/40 backdrop-blur-sm"><div className={`${glass} px-6 py-4 rounded-2xl animate-pulse`}>{busy}</div></div>}
+          <input ref={fileRef} type="file" accept="application/pdf" className="hidden" onChange={upload} />
+
+          {session.tab === 'home' && <Home folder={folder} doc={doc} onUpload={() => fileRef.current.click()} go={t => setSession({ tab: t })} folderDocs={folderDocs} open={id => setSession({ docId: id, page: 1 })} />}
+          {session.tab !== 'home' && !doc && <Empty onUpload={() => fileRef.current.click()} hasFolder={!!folder} />}
+          {session.tab === 'learn' && doc && <Learn doc={doc} pg={pg} pdf={pdf} page={session.page} setPage={n => setSession({ page: Math.min(Math.max(1, n), doc.pages.length) })} hidePdf={hidePdf} setHidePdf={setHidePdf} explain={explain} mark={() => updatePage(session.page, { isLearned: !pg.isLearned })} />}
+          {session.tab === 'study' && doc && <Study doc={doc} />}
+          {session.tab === 'test' && doc && <Test doc={doc} />}
+          {session.tab === 'revise' && doc && <Revise doc={doc} />}
+        </main>
+      </div>
+
+      {showSettings && <Settings settings={settings} setSettings={setSettings} onClose={() => setShowSettings(false)} exportAll={exportAll} importAll={importAll} reset={reset} />}
+    </div>
+  );
+}
+
+const Empty = ({ onUpload, hasFolder }) => (
+  <div className="h-full grid place-items-center text-center p-6"><div className="fade"><div className="text-5xl mb-3">📚</div><p className="opacity-70 mb-4">Open a PDF from the sidebar{hasFolder ? ' or upload a new one' : ''}.</p>{hasFolder && <Btn onClick={onUpload} className="px-5 py-3 rounded-2xl bg-indigo-500 text-white shadow-lg">⬆ Upload PDF</Btn>}</div></div>
+);
+
+function Home({ folder, doc, onUpload, go, folderDocs, open }) {
+  if (!folder) return <div className="h-full grid place-items-center opacity-70">Create a subject folder in the sidebar to begin.</div>;
+  if (!doc) return (
+    <div className="h-full overflow-auto p-8 fade">
+      <h2 className="text-2xl font-bold mb-1">📁 {folder.name}</h2>
+      <p className="opacity-60 mb-6">{folderDocs.length ? 'Pick a PDF or upload another.' : 'No PDFs yet in this folder.'}</p>
+      <Btn onClick={onUpload} className="px-6 py-3 rounded-2xl bg-gradient-to-r from-indigo-500 to-fuchsia-500 text-white shadow-xl shadow-indigo-500/30 mb-6">⬆ Upload PDF</Btn>
+      <div className="grid gap-3 grid-cols-[repeat(auto-fill,minmax(220px,1fr))]">
+        {folderDocs.map(d => <Btn key={d.id} onClick={() => open(d.id)} className={`${glass} rounded-2xl p-4 text-left`}><div className="text-2xl">📄</div><div className="font-semibold truncate">{d.name}</div><div className="text-xs opacity-60">{d.pages.length} pages · {d.pages.filter(p => p.isLearned).length} learned</div></Btn>)}
+      </div>
+    </div>
+  );
+  const total = doc.pages.length, learned = doc.pages.filter(p => p.isLearned).length, expl = doc.pages.filter(p => p.isExplained).length;
+  const pct = Math.round(learned / total * 100);
+  return (
+    <div className="h-full overflow-auto p-8 flex flex-col items-center justify-center gap-8 fade">
+      <div className="text-center"><div className="text-sm opacity-60">{folder.name}</div><h2 className="text-2xl font-bold">{doc.name}</h2></div>
+      <div className="w-full max-w-xl">
+        <div className="flex justify-between text-xs opacity-70 mb-1"><span>{learned}/{total} pages learned · {expl} explained</span><span>{pct}%</span></div>
+        <div className="h-3 rounded-full bg-black/10 dark:bg-white/10 overflow-hidden"><div className="h-full bg-gradient-to-r from-indigo-500 to-fuchsia-500 transition-all duration-700" style={{ width: pct + '%' }} /></div>
+      </div>
+      <div className="flex gap-8 flex-wrap justify-center">
+        {[['learn', '📖', 'Learn', 'from-indigo-500 to-blue-500'], ['test', '🧪', 'Test', 'from-fuchsia-500 to-pink-500']].map(([t, i, l, g]) =>
+          <Btn key={t} onClick={() => go(t)} className={`w-40 h-40 rounded-full bg-gradient-to-br ${g} text-white shadow-2xl flex flex-col items-center justify-center hover:scale-105`}><span className="text-4xl">{i}</span><span className="font-bold text-lg">{l}</span></Btn>)}
+      </div>
+      <div className="flex gap-4 flex-wrap justify-center">
+        <Btn onClick={() => go('revise')} className={`${glass} px-8 py-3 rounded-full font-semibold`}>⚡ Quick Revision</Btn>
+        <Btn onClick={() => go('study')} className={`${glass} px-8 py-3 rounded-full font-semibold`}>🗒️ Study Notes</Btn>
+        <Btn onClick={() => go('learn')} className={`${glass} px-8 py-3 rounded-full font-semibold`}>💬 Ask AI</Btn>
+      </div>
+    </div>
+  );
+}
+
+function Learn({ doc, pg, pdf, page, setPage, hidePdf, setHidePdf, explain, mark }) {
+  const total = doc.pages.length;
+  useEffect(() => {
+    const k = e => { if (/INPUT|TEXTAREA/.test(e.target.tagName)) return; if (e.key === 'ArrowRight') setPage(page + 1); if (e.key === 'ArrowLeft') setPage(page - 1); };
+    window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k);
+  }, [page]);
+  return (
+    <div className="h-full flex flex-col">
+      <div className="flex items-center justify-center gap-3 py-2 border-b border-black/10 dark:border-white/10 text-sm">
+        <IconBtn onClick={() => setPage(page - 1)}>◀</IconBtn>
+        <span>Page <input type="number" min="1" max={total} value={page} onChange={e => setPage(+e.target.value || 1)} className="w-14 text-center rounded-lg bg-transparent border border-black/20 dark:border-white/20" /> / {total}</span>
+        <IconBtn onClick={() => setPage(page + 1)}>▶</IconBtn>
+        {pg?.chapter && <span className="opacity-60 hidden md:inline">· {pg.chapter}</span>}
+      </div>
+      <div className="flex-1 flex min-h-0 relative">
+        <section className={`relative transition-all duration-300 overflow-hidden ${hidePdf ? 'w-0' : 'w-1/2'}`}>
+          <div className="absolute inset-0 min-w-[300px]"><PdfPane pdf={pdf} page={page} /></div>
+          <Btn onClick={mark} className={`absolute bottom-5 left-5 z-10 px-4 py-2 rounded-full shadow-xl font-semibold ${pg?.isLearned ? 'bg-emerald-500 text-white' : 'bg-white/90 text-slate-800'}`}>{pg?.isLearned ? '✓ Learned' : '✓ Mark'}</Btn>
+        </section>
+        <div className="w-px bg-black/10 dark:bg-white/10 relative">
+          <Btn onClick={() => setHidePdf(!hidePdf)} title="Toggle PDF" className={`${glass} absolute top-1/2 -translate-y-1/2 -translate-x-1/2 z-20 w-9 h-16 rounded-full text-xs [writing-mode:vertical-rl]`}>{hidePdf ? 'Show PDF' : 'Hide PDF'}</Btn>
+        </div>
+        <section className="flex-1 relative min-w-0">
+          <div className="h-full overflow-auto p-6 pb-24">
+            {pg?.isExplained
+              ? <div className="te fade max-w-3xl mx-auto" dangerouslySetInnerHTML={{ __html: pg.teluguTranslation }} />
+              : <div className="h-full grid place-items-center text-center opacity-60"><div><div className="text-4xl mb-2">✨</div>Press Explain to get the Telugu explanation of this page.</div></div>}
+          </div>
+          <Btn onClick={explain} className="absolute bottom-5 right-5 px-5 py-2.5 rounded-full bg-gradient-to-r from-indigo-500 to-fuchsia-500 text-white font-semibold shadow-xl shadow-indigo-500/40">{pg?.isExplained ? '↻ Re-explain' : '✨ Explain'}</Btn>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function Study({ doc }) {
+  const items = doc.pages.filter(p => p.isLearned && p.studyNote);
+  return (
+    <div className="h-full overflow-auto p-6"><div className="max-w-3xl mx-auto grid gap-4">
+      <h2 className="text-xl font-bold">🗒️ Study notes · {doc.name}</h2>
+      {!items.length && <p className="opacity-60">Mark pages as learned (after explaining them) and their notes will appear here.</p>}
+      {items.map(p => <article key={p.pageNumber} className={`${glass} rounded-2xl p-5 fade`}><div className="text-xs opacity-60 mb-1">Page {p.pageNumber}{p.chapter ? ' · ' + p.chapter : ''}</div><div className="te whitespace-pre-wrap" style={{ lineHeight: 1.8 }}>{p.studyNote}</div></article>)}
+    </div></div>
+  );
+}
+
+function Test({ doc }) {
+  const qs = doc.pages.filter(p => p.quiz && p.isExplained);
+  const [picked, setPicked] = useState({});
+  const score = qs.filter(p => picked[p.pageNumber] === p.quiz.ans).length;
+  return (
+    <div className="h-full overflow-auto p-6"><div className="max-w-3xl mx-auto grid gap-5">
+      <div className="flex justify-between items-center"><h2 className="text-xl font-bold">🧪 Test · {doc.name}</h2>{qs.length > 0 && <div className="flex items-center gap-3 text-sm"><span>Score {score}/{Object.keys(picked).length}</span><IconBtn onClick={() => setPicked({})}>Reset</IconBtn></div>}</div>
+      {!qs.length && <p className="opacity-60">Explain some pages in Learn to generate questions.</p>}
+      {qs.map((p, qi) => {
+        const sel = picked[p.pageNumber], done = sel !== undefined;
+        return <div key={p.pageNumber} className={`${glass} rounded-2xl p-5`}>
+          <div className="text-xs opacity-60 mb-1">Q{qi + 1} · Page {p.pageNumber}</div>
+          <div className="font-semibold mb-3">{p.quiz.q}</div>
+          <div className="grid gap-2">{p.quiz.options.map((o, i) => {
+            let c = 'border-black/10 dark:border-white/15 hover:bg-black/5 dark:hover:bg-white/10';
+            if (done && i === p.quiz.ans) c = 'bg-emerald-500/30 border-emerald-500';
+            else if (done && i === sel) c = 'bg-red-500/30 border-red-500';
+            return <Btn key={i} disabled={done} onClick={() => setPicked({ ...picked, [p.pageNumber]: i })} className={`text-left px-4 py-2.5 rounded-xl border ${c} disabled:opacity-100`}>{String.fromCharCode(65 + i)}. {o}</Btn>;
+          })}</div>
+          {done && sel !== p.quiz.ans && <div className="te mt-3 p-3 rounded-xl bg-red-500/10 border border-red-500/30 fade"><b>వివరణ:</b> {p.quiz.explanation}</div>}
+          {done && sel === p.quiz.ans && <div className="te mt-3 p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 fade">✅ {p.quiz.explanation}</div>}
+        </div>;
+      })}
+    </div></div>
+  );
+}
+
+function Revise({ doc }) {
+  const cards = doc.pages.filter(p => p.isExplained && p.studyNote);
+  const [i, setI] = useState(0);
+  const c = cards[Math.min(i, cards.length - 1)];
+  if (!c) return <div className="h-full grid place-items-center opacity-60">Explain pages in Learn to build revision cards.</div>;
+  return (
+    <div className="h-full flex flex-col items-center justify-center p-6 gap-5">
+      <div key={c.pageNumber} className={`${glass} fade rounded-3xl p-10 w-full max-w-3xl max-h-[70%] overflow-auto`}>
+        <div className="text-sm opacity-60 mb-3">Page {c.pageNumber}{c.chapter ? ' · ' + c.chapter : ''}</div>
+        <div className="te text-2xl font-bold whitespace-pre-wrap" style={{ lineHeight: 1.6 }}>{c.studyNote}</div>
+      </div>
+      <div className="flex items-center gap-4"><IconBtn onClick={() => setI(Math.max(0, i - 1))}>◀ Prev</IconBtn><span className="text-sm opacity-70">{Math.min(i, cards.length - 1) + 1} / {cards.length}</span><IconBtn onClick={() => setI(Math.min(cards.length - 1, i + 1))}>Next ▶</IconBtn></div>
+    </div>
+  );
+}
+
+function Settings({ settings, setSettings, onClose, exportAll, importAll, reset }) {
+  const [key, setKey] = useState(settings.apiKey), [wp, setWp] = useState(settings.wallpaper), [model, setModel] = useState(settings.model);
+  const input = 'w-full px-3 py-2 rounded-xl bg-black/5 dark:bg-white/10 border border-black/10 dark:border-white/15 outline-none text-sm';
+    const imp = useRef();
+    return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/50 backdrop-blur-sm p-4" onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} className={`${glass} !bg-white/90 dark:!bg-slate-900/90 rounded-3xl p-6 w-full max-w-lg max-h-full overflow-auto fade`}>
+        <div className="flex justify-between mb-4"><h3 className="text-lg font-bold">⚙️ Settings</h3><button onClick={onClose}>✕</button></div>
+        <h4 className="text-xs uppercase tracking-widest opacity-60 mb-2">AI</h4>
+        <label className="text-sm">Gemini API key</label>
+        <input type="password" value={key} onChange={e => setKey(e.target.value)} placeholder="Paste key from aistudio.google.com" className={input + ' mb-2'} />
+        <label className="text-sm">Model</label>
+        <input value={model} onChange={e => setModel(e.target.value)} className={input + ' mb-2'} />
+        <Btn onClick={() => setSettings({ apiKey: key.trim(), model: model.trim() || 'gemini-2.5-flash' })} className="px-4 py-2 rounded-xl bg-indigo-500 text-white text-sm mb-5">Save AI settings</Btn>
+        <h4 className="text-xs uppercase tracking-widest opacity-60 mb-2">Appearance</h4>
+        <div className="flex items-center justify-between mb-2 text-sm"><span>Dark mode</span><Btn onClick={() => setSettings({ dark: !settings.dark })} className={`w-12 h-6 rounded-full relative ${settings.dark ? 'bg-indigo-500' : 'bg-slate-400'}`}><span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all ${settings.dark ? 'left-6' : 'left-0.5'}`} /></Btn></div>
+        <label className="text-sm">Wallpaper URL</label>
+        <div className="flex gap-2 mb-5"><input value={wp} onChange={e => setWp(e.target.value)} placeholder="https://…/image.jpg" className={input} /><Btn onClick={() => setSettings({ wallpaper: wp.trim() })} className="px-3 rounded-xl bg-indigo-500 text-white text-sm">Apply</Btn></div>
+        <h4 className="text-xs uppercase tracking-widest opacity-60 mb-2">Data</h4>
+        <div className="flex flex-wrap gap-2">
+          <Btn onClick={exportAll} className="px-4 py-2 rounded-xl bg-emerald-600 text-white text-sm">⬇ Export backup</Btn>
+          <Btn onClick={() => imp.current.click()} className="px-4 py-2 rounded-xl bg-sky-600 text-white text-sm">⬆ Import backup</Btn>
+          <Btn onClick={reset} className="px-4 py-2 rounded-xl bg-red-600 text-white text-sm">Factory Reset</Btn>
+          <input ref={imp} type="file" accept=".json,application/json" className="hidden" onChange={importAll} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

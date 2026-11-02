@@ -1,0 +1,16 @@
+{
+  "name": "eduhabit-studio",
+  "version": "1.0.0",
+  "description": "Bilingual local-first study companion",
+  "author": "EduHabit",
+  "main": "main.js",
+  "scripts": { "start": "electron .", "dist": "electron-builder --win nsis --publish never" },
+  "devDependencies": { "electron": "^31.0.0", "electron-builder": "^24.13.3" },
+  "build": {
+    "appId": "com.eduhabit.studio",
+    "productName": "EduHabit Studio",
+    "files": ["main.js", "app/**"],
+    "win": { "target": "nsis" },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true }
+  }
+}
